@@ -13,16 +13,20 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ====== Get news from OpenAI ======
-def fetch_openai_news():
+def fetch_gemini_news():
     prompt = """
-    最新のAIニュースを3つ、箇条書きで短くまとめてください。
-    重要ポイントだけでOK。
+    最新のAIツール・AI業界ニュースを日本語で3つ。
+    箇条書きで、短く、重要ポイントのみ。
     """
-    res = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return res.choices[0].message.content
+    try:
+        # まずはこのモデルでトライ（将来ここだけ差し替えればOK）
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        res = model.generate_content(prompt)
+        return res.text
+    except Exception as e:
+        # Gemini側でエラーが出ても全体が止まらないようにする
+        print("Gemini error:", e)
+        return "※Gemini側のニュース取得でエラーが発生したため、今回はChatGPT側の情報のみです。"
 
 
 # ====== Get news from Gemini ======
