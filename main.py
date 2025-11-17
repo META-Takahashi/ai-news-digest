@@ -31,7 +31,7 @@ def fetch_gemini_news():
     最新のAIツール・AI業界ニュースを日本語で3つ。
     箇条書きで、短く、重要ポイントのみ。
     """
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-pro")
     res = model.generate_content(prompt)
     return res.text
 
