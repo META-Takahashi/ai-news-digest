@@ -29,15 +29,15 @@ def fetch_openai_news():
     return res.choices[0].message.content
 
 
-# ====== Get news from Gemini ======
+# ===== Get news from Gemini =====
 def fetch_gemini_news():
-    prompt = """
-    最新のAIツール・AI業界ニュースを日本語で3つ。
-    箇条書きで、短く、重要ポイントのみ。
     """
-    model = genai.GenerativeModel("gemini-pro")
-    res = model.generate_content(prompt)
-    return res.text
+    今はChatGPTメインでニュース取得。
+    Gemini側は後で安定してから接続する想定なので、
+    とりあえず固定メッセージを返しておく。
+    """
+    return "※Gemini側のニュースは現在調整中です。（後日アップデート予定）"
+
 
 
 # ====== Send message to Lark ======
