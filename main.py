@@ -1,76 +1,38 @@
 import os
-import re
-import html
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-
 import requests
+from xml.etree import ElementTree
+
 from openai import OpenAI
 
-
-# ===== 環境変数（GitHub Secrets から来る） =====
+# ===== 環境変数（GitHub Secrets から） =====
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 LARK_WEBHOOK_URL = os.environ.get("LARK_WEBHOOK_URL")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY が設定されていません。GitHub Secrets を確認してください。")
-if not LARK_WEBHOOK_URL:
-    raise RuntimeError("LARK_WEBHOOK_URL が設定されていません。GitHub Secrets を確認してください。")
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# ===== 対象とするAIニュース系RSSフィード（Google News 検索RSS） =====
+# 実際のニュースソースはここから取得される
+RSS_FEEDS = [
+    (
+        "general",
+        "https://news.google.com/rss/search?q=%22生成AI%22+OR+%22generative+AI%22&hl=ja&gl=JP&ceid=JP:ja",
+    ),
+    (
+        "business",
+        "https://news.google.com/rss/search?q=AI+%E5%B7%A5%E4%BD%9C%E6%95%88%E7%8E%87+OR+AI%E5%B0%8E%E5%85%A5+OR+AI%E4%BC%81%E6%A5%AD&hl=ja&gl=JP&ceid=JP:ja",
+    ),
+    (
+        "education",
+        "https://news.google.com/rss/search?q=AI+%E6%95%99%E8%82%B2+OR+EdTech+AI&hl=ja&gl=JP&ceid=JP:ja",
+    ),
+    (
+        "tools",
+        "https://news.google.com/rss/search?q=AI+%E3%83%84%E3%83%BC%E3%83%AB+OR+AI+%E3%82%B5%E3%83%BC%E3%83%93%E3%82%B9+OR+%22ChatGPT%22+OR+%22Claude%22+OR+%22Gemini%22&hl=ja&gl=JP&ceid=JP:ja",
+    ),
+]
 
-# ===== シンプルな HTML除去 =====
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    text = html.unescape(text)
-    # ごく簡単にタグを消す
-    text = re.sub(r"<.*?>", "", text)
-    # 改行と余分な空白を整形
-    text = re.sub(r"\s+\n", "\n", text)
-    text = re.sub(r"\n\s+", "\n", text)
-    return text.strip()
-
-
-# ===== Google News RSS から AI 関連ニュースを取得 =====
-GOOGLE_NEWS_RSS_URL = (
-    "https://news.google.com/rss/search?q=AI+OR+%22人工知能%22+OR+%22生成AI%22"
-    "&hl=ja&gl=JP&ceid=JP:ja"
-)
-
-
-def fetch_rss_articles(max_items: int = 20):
-    """
-    Google News RSS から AI 関連ニュースを最大 max_items 件取ってくる
-    戻り値: [{title, link, description}, ...]
-    """
-    resp = requests.get(GOOGLE_NEWS_RSS_URL, timeout=10)
-    resp.raise_for_status()
-    xml_text = resp.text
-
-    root = ET.fromstring(xml_text)
-    items = []
-    # RSS の item ノードをざっくり取る
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        desc = strip_html(item.findtext("description") or "")
-        if not title or not link:
-            continue
-        items.append(
-            {
-                "title": title,
-                "link": link,
-                "description": desc,
-            }
-        )
-        if len(items) >= max_items:
-            break
-    return items
-
-
-# ===== OpenAI でダイジェスト文面を生成 =====
+# ===== 事業分野一覧（セクション3で必ず全部出す） =====
 BUSINESS_FIELDS = [
     "情報通信（IT・AI）",
     "マーケティング・広告",
@@ -89,65 +51,106 @@ BUSINESS_FIELDS = [
 ]
 
 
-def build_digest_with_openai(articles):
+# ===== RSSからAIニュース候補を取得 =====
+def fetch_ai_news_from_rss(max_items: int = 20):
     """
-    RSS から取ってきた実ニュース一覧を GPT に渡して
-    AI講師向けニュースレター形式に整形してもらう
+    Google News のRSSからAI関連ニュースのタイトルとURLを取得してリストで返す。
+    戻り値: [{"title": ..., "url": ..., "tag": ...}, ...]
     """
+    articles = []
+    seen = set()
+
+    for tag, feed_url in RSS_FEEDS:
+        try:
+            resp = requests.get(feed_url, timeout=10)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[WARN] RSS取得失敗: {feed_url} - {e}")
+            continue
+
+        try:
+            root = ElementTree.fromstring(resp.content)
+        except Exception as e:
+            print(f"[WARN] RSSパース失敗: {feed_url} - {e}")
+            continue
+
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            if title_el is None or link_el is None:
+                continue
+
+            title = (title_el.text or "").strip()
+            url = (link_el.text or "").strip()
+            if not title or not url:
+                continue
+
+            key = (title, url)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            articles.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "tag": tag,
+                }
+            )
+
+            if len(articles) >= max_items:
+                return articles
+
+    return articles
+
+
+# ===== OpenAIでダイジェスト文章に整形 =====
+def build_digest_with_openai(articles: list[dict]) -> str:
+    """
+    RSSから取得したarticlesを元に、
+    指定フォーマットの「AIニュースダイジェスト（AI講師向け）」テキストを生成する。
+    """
+    # 日付（JST）
+    now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
+    today_date_str = now_jst.strftime("%Y/%m/%d (%a)")
+
+    # ニュース候補一覧をテキスト化（LLMへのインプット用）
     if not articles:
-        return "🎨 AIニュースダイジェスト（AI講師向け）\n今日は取得できたAIニュースがありませんでした。"
+        articles_text = "（RSSからニュースが取得できませんでした）"
+    else:
+        lines = []
+        for idx, art in enumerate(articles, start=1):
+            lines.append(
+                f"{idx}. [{art['tag']}] {art['title']}\n   URL: {art['url']}"
+            )
+        articles_text = "\n".join(lines)
 
-    # 日本時間
-    today = datetime.now(timezone.utc) + timedelta(hours=9)
-    today_date_str = today.strftime("%Y/%m/%d (%a)")
+    business_fields_str = ", ".join(BUSINESS_FIELDS)
 
-    # モデルに渡す「生の素材」
-    # 形式: 1. タイトル :: URL :: 説明
-    article_lines = []
-    for i, art in enumerate(articles, start=1):
-        line = f"{i}. {art['title']} :: {art['link']} :: {art['description']}"
-        article_lines.append(line)
-    raw_list_text = "\n".join(article_lines)
+    prompt = f"""あなたは「AI講師向けニュースレター」の編集者です。
+以下の「ニュース候補一覧」だけを情報源として、AI講師が授業・研修ですぐ使える形にニュースを整理してください。
 
-    # プロンプト
-    system_prompt = (
-        "あなたは日本の『AI講師向けニュースレター編集者』です。"
-        "渡された実ニュース一覧だけを元に、指定フォーマットで日本語のダイジェストを作成してください。"
-        "必ず渡されたURLだけを参考URLとして使い、URLを捏造したり、存在しないサービス名・モデル名を発明しないでください。"
-    )
+【ニュース候補一覧】
+{articles_text}
 
-    user_prompt = f"""
-以下に、Google News RSS から取得した「AI関連ニュース記事の一覧」があります。
+重要:
+- 上記の「タイトル」と「URL」以外の具体的な数値・発言・出来事を勝手に作らないでください。
+- 分からない部分は一般的な表現にとどめてください（例：「〜などのテーマが議論されています」）。
+- 最後に「📎 参考URL」として、上記ニュース候補の中から使えそうなタイトルとURLを列挙してください。
+- 出力はすべて日本語。
+- 絵文字や見出しのフォーマットは下記をそのまま使ってください。
 
-それぞれの形式は：
-番号. タイトル :: URL :: 説明
-です。
+出力フォーマットは次のとおりです。このフォーマットから外れないでください:
 
-========
-{raw_list_text}
-========
-
-これらの実ニュースだけを元にして、
-AI講師が「そのまま授業・研修に使える」形のダイジェストを作成してください。
-
-【重要な制約】
-- 出力はすべて日本語
-- 存在しないモデル名・サービス名・ニュースを新しく作らない
-- 参考URLは、必ず上記一覧に含まれている URL のみを使う
-- 一つのニュースを複数のセクションで使ってもよいが、話を盛りすぎない
-- 見やすさ優先で、シンプルなテキスト＋最低限の記号だけにする（Larkで読みやすいように）
-
-【出力フォーマット】
-
-🎨 AIニュースダイジェスト（AI講師向け）
-{today_date_str}
+🎨 AIニュースダイジェスト（AI講師向け）  
+{today_date_str}  
 未来の授業づくりにすぐ活かせる「今日のAIトピック」を厳選してお届けします。
 
 🌟 1. 生成AIニュース
-ここには「モデル・技術・サービス」寄りのニュースを2〜4件、以下のミニブロック形式で書いてください：
+ここには「モデル・技術・サービス・AIソフト」寄りのニュースを3〜5件、次のミニブロック形式でまとめてください：
 
 ● タイトル（できるだけ具体的に）
-  概要：2〜3文で要約
+  概要：2〜3文で要約（ニュース候補一覧を元に）
   授業アイデア：授業やワークに使えるアイデアを1〜2文
 
 🏭 2. 企業のAI活用
@@ -157,69 +160,70 @@ AI講師が「そのまま授業・研修に使える」形のダイジェスト
   概要：2〜3文
   授業ポイント：AI導入のメリット・課題など、講師目線の解説ポイントを1〜2文
 
-🎓 3. 教育×AI / 業界別AI動向
+🎓 3. 業界別AI動向
 以下の事業分野ごとに、該当しそうなニュースがあれば1〜2文でまとめてください。
 完全に該当するニュースが見つからない分野は「現時点では目立ったニュースは無し（今後の様子見）」のように一言コメントしてください。
 
 事業分野一覧：
-{", ".join(BUSINESS_FIELDS)}
+{business_fields_str}
 
-出力例（形式だけ参考に）：
+出力形式の例（あくまで形式だけ参考に）：
 - 情報通信（IT・AI）：〜〜〜
 - マーケティング・広告：〜〜〜
-（以下、全分野分続ける）
+（上のリストにある全分野をこの形式で出してください）
 
 🛠️ 4. AIツール最新アップデート
-上記ニュースの中から「ツール・サービスの機能アップデート/新機能」に当たりそうなものを3〜5件ピックアップして：
+上記ニュース候補の中から「ツール・サービスの機能アップデート/新機能」に当たりそうなものを3〜5件ピックアップして：
 
-- ツール名：アップデート内容
+- ツール名：アップデート内容（ニュース候補に基づいて大まかに）
   講師視点：どんな授業・研修で使えそうか一言
 
 💡 5. 授業で使えるネタ・実践アイデア
 今日のニュースを元にした授業ネタ・ワークショップ案を4〜6個、箇条書きで出してください。
-各アイデアは「タイトル：一言説明」の形で。
+各アイデアは「タイトル：一言説明」の形で、シンプルに書いてください。
+
+最後に、次のような形で「📎 参考URL」セクションを付けてください。
+ここでは、ニュース候補一覧で使った（または関連が深い）記事を中心にタイトルとURLを列挙してください。
 
 📎 参考URL
-最後に、上の本文中で実際に触れたニュースの URL だけを、以下の形式でまとめてください：
+- [タイトル1](URL1)
+- [タイトル2](URL2)
+- ...
 
-- [ニュースタイトル](URL)
-
-※ 参考URLには、必ず実在する上記のURLだけを使い、数も多すぎず（5〜10件程度）にしてください。
+以上のフォーマットに沿って、AI講師が読みやすく・そのまま転用しやすいテキストを出力してください。
 """
 
     res = openai_client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.4,
     )
-
     return res.choices[0].message.content
 
 
-# ===== Lark へテキスト送信 =====
+# ===== Lark へ送信 =====
 def send_to_lark(text: str):
-    payload = {
-        "msg_type": "text",
-        "content": {"text": text},
-    }
+    if not LARK_WEBHOOK_URL:
+        raise RuntimeError(
+            "LARK_WEBHOOK_URL が設定されていません。GitHub Secrets を確認してください。"
+        )
+
+    payload = {"msg_type": "text", "content": {"text": text}}
     resp = requests.post(LARK_WEBHOOK_URL, json=payload, timeout=10)
     resp.raise_for_status()
 
 
 # ===== メイン処理 =====
 def main():
-    print("Fetching RSS articles...")
-    articles = fetch_rss_articles(max_items=20)
+    print("Fetching RSS news...")
+    articles = fetch_ai_news_from_rss(max_items=20)
 
-    print(f"Fetched {len(articles)} articles from Google News RSS.")
+    print(f"Fetched {len(articles)} articles from RSS.")
     digest_text = build_digest_with_openai(articles)
 
     print("Sending digest to Lark...")
     send_to_lark(digest_text)
-    print("Done.")
+    print("Done!")
 
 
 if __name__ == "__main__":
