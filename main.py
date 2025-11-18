@@ -1,9 +1,11 @@
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
+import feedparser
 from openai import OpenAI
-import google.generativeai as genai  # 将来用
+import google.generativeai as genai  # 将来用（いまは未使用）
 
 
 # ===== 環境変数（GitHub Secrets から来る） =====
@@ -17,108 +19,142 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 
-# ===== OpenAI からニュース作成 =====
-def fetch_openai_news():
-    """OpenAI (ChatGPT) を使って、AI講師向けのニュース要約をつくる。"""
-    # 日本時間
-    today = datetime.now(timezone.utc) + timedelta(hours=9)
-    date_str = today.strftime("%Y/%m/%d (%a)")
+# ===== 日付ヘルパー（日本時間） =====
+def get_today_jst():
+    jst_now = datetime.now(timezone.utc) + timedelta(hours=9)
+    date_str = jst_now.strftime("%Y/%m/%d (%a)")
+    return date_str
 
-    prompt = f'''あなたは「AI講師のためのニュース編集者」です。
 
-目的：
-AI・生成AI・AIツール・教育（EdTech）領域の最新情報を、
-AI講師が授業・研修・講演で“そのまま使える形”に整理して提供してください。
+# ===== ニュースRSSから実記事を取得 =====
+def fetch_ai_articles(max_items=8):
+    """AI関連ニュースのRSSをいくつか叩いて、タイトル・概要・URLを集める"""
+    feeds = [
+        # AI全般（Google News）
+        "https://news.google.com/rss/search?q=人工知能+OR+AI+OR+生成AI&hl=ja&gl=JP&ceid=JP:ja",
+        # TechCrunch AI
+        "https://techcrunch.com/tag/artificial-intelligence/feed/",
+        # The Verge AI
+        "https://www.theverge.com/rss/artificial-intelligence/index.xml",
+    ]
 
-出力フォーマットは、下記の構造と記号・絵文字を厳守してください。
-（サンプルの文言は置き換えてOKですが、「見出しの形」と「階層構造」は崩さないこと）
+    articles = []
+    for feed_url in feeds:
+        parsed = feedparser.parse(feed_url)
+        for entry in parsed.entries:
+            link = entry.get("link")
+            title = entry.get("title", "").strip()
+            summary = entry.get("summary", "").strip()
+
+            if not link or not title:
+                continue
+
+            domain = urlparse(link).netloc.replace("www.", "")
+            articles.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "link": link,
+                    "source": domain,
+                }
+            )
+
+    # 重複を簡易的に削る（URLベース）
+    unique = {}
+    for a in articles:
+        if a["link"] not in unique:
+            unique[a["link"]] = a
+
+    articles = list(unique.values())[:max_items]
+    return articles
+
+
+# ===== OpenAI で「AI講師向けニュース」に整形 =====
+def build_digest_with_openai(articles):
+    today_str = get_today_jst()
+
+    if not articles:
+        base_news_list = "ニュース記事が取得できませんでした。AI講師向けの汎用トピックを出してください。"
+    else:
+        lines = []
+        for i, a in enumerate(articles, start=1):
+            lines.append(
+                f"{i}. {a['title']}\n"
+                f"   source: {a['source']}\n"
+                f"   url   : {a['link']}\n"
+                f"   summary: {a['summary'][:240]}..."
+            )
+        base_news_list = "\n\n".join(lines)
+
+    prompt = f'''
+あなたは「AI講師のためのニュース編集者」です。
+以下の “実際のニュース記事リスト” をもとに、
+Lark（スマホ）で読みやすい形のニュースダイジェストを作ってください。
+
+# 前提
+- 対象：AIリテラシーやAI活用を教える「講師・先生・研修担当」
+- トーン：専門的だけど、噛み砕かれていて安心できる感じ
+- 行間多め・セクションごとに空行を入れてスマホで読みやすく
+- 箇条書き・見出し・絵文字を活用して、「流し読み」でも要点がわかること
+- ニュースの内容は、下の「ニュース候補リスト」からのみ要約して使うこと
+  （URLやタイトルを勝手に捏造しない）
+
+# 出力フォーマット（この形を守る）
 
 🎨 AIニュースダイジェスト（AI講師向け）
-{date_str}
+{today_str}
 未来の授業づくりにすぐ活かせる「今日のAIトピック」を厳選してお届けします。
 
-🌟 1. 生成AIニュース
-● タイトル１（例：🚀 新モデル〜 など）
-概要：2〜3文で要約
-ポイント：
-- 重要な変化・特徴を箇条書きで2〜3個
-授業アイデア：
-→ 授業や研修でどう活かせるかを1〜2文で具体的に
+🌟 1. 生成AIニュース（2〜3本）
+それぞれについて：
+- タイトル
+- 概要（2〜3文）
+- 授業アイデア（「→」で始まる箇条書き 1〜2個）
 
-● タイトル２
-概要：
-ポイント：
-授業アイデア：
+🏭 2. 企業のAI活用（2本程度）
+- どの業界で、どんなAI活用か
+- その事例が授業でどう使えるか（ポイントを2〜3行）
 
-🏭 2. 企業のAI活用
-● タイトル１（例：業界 × どんなAI活用か）
-背景・ねらい：
-- 業界や部門の課題
-- どのようにAIで解決しようとしているか
-授業ポイント：
-→ 「AIが得意なこと／不得意なこと」が分かる説明を1〜2文
-
-● タイトル２
-背景・ねらい：
-授業ポイント：
-
-🎓 3. 教育×AI 動向
-● タイトル１
-内容：
-- 学校／大学／企業研修のどの部分にAIが入ってきているか
-講師が意識すべきポイント：
-- 3つ前後、箇条書き
+🎓 3. 教育×AI 動向（1〜2本）
+- どの教育現場か（学校・大学・企業研修 など）
+- 講師が押さえるべき観点（3つくらい）
 
 🛠️ 4. AIツール最新アップデート
-（ChatGPT / Claude / Gemini / Runway / Suno / Notion AI / Recraft など、実在の有名ツール名を優先）
-💬 ツール名１：アップデート内容の要約
-→ どんな講師・授業に向いているか（1行）
+- ChatGPT / Claude / Gemini / Runway / Suno / Notion AI などから
+- 講師目線で「どんな授業パーツとして使えそうか」を短くコメント
 
-💬 ツール名２：アップデート内容の要約
-→ どんな講師・授業に向いているか（1行）
+💡 5. 授業で使えるネタ・実践アイデア（3〜5個）
+- 授業タイトル案や、ワークショップ案を箇条書きで
 
-💬 ツール名３：アップデート内容の要約
-→ どんな講師・授業に向いているか（1行）
+────────────
+🔗 参考URL
+最後に、「[1] サイト名『タイトル』: URL」という形式で、
+上で使ったニュース記事のURLだけを一覧で出してください。
+※ここでは、必ず入力として渡したURLだけを使うこと。新しいURLは作らないこと。
 
-💡 5. 授業で使えるネタ・実践アイデア
-（今日のニュースをもとに、すぐ実践できる授業案を3〜5個）
-🎨 アイデア１：
-→ どんな授業か／どんな流れかを2〜3文で
-
-🎶 アイデア２：
-→ どんな授業か／どんな流れかを2〜3文で
-
-🏭 アイデア３：
-→ どんな授業か／どんな流れかを2〜3文で
-
-可能な限り、実在しそうな企業・業界・ツール名を用いつつ、
-事実と断定できない部分は「〜と言われています」「〜が想定されます」のような表現にしてください。
-難しい専門用語には（かっこで一言解説）を添えてください。'''
+# ニュース候補リスト
+{base_news_list}
+'''
 
     res = openai_client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.5,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4,
     )
     return res.choices[0].message.content
-
-
-# ===== Gemini 側（今はダミー） =====
-def fetch_gemini_news():
-    return "※Gemini 側のニュース連携は現在調整中です。（後日、画像・論文要約などで拡張予定）"
 
 
 # ===== Lark へ送信 =====
 def send_to_lark(text: str):
     if not LARK_WEBHOOK_URL:
-        raise RuntimeError("LARK_WEBHOOK_URL が設定されていません。GitHub Secrets を確認してください。")
+        raise RuntimeError(
+            "LARK_WEBHOOK_URL が設定されていません。GitHub Secrets を確認してください。"
+        )
 
     payload = {
         "msg_type": "text",
         "content": {
-            "text": text
+            "text": text,
         },
     }
     resp = requests.post(LARK_WEBHOOK_URL, json=payload)
@@ -127,23 +163,19 @@ def send_to_lark(text: str):
 
 # ===== メイン処理 =====
 def main():
-    print("Fetching AI news...")
+    print("Fetching raw AI news articles...")
+    articles = fetch_ai_articles()
 
-    openai_news = fetch_openai_news()
-    gemini_part = fetch_gemini_news()
-
-    message = f'''📚 AIニュースダイジェスト（AI講師向け）
-
-{openai_news}
-
----
-📝 Gemini からの補足
-{gemini_part}
-'''
+    print(f"Fetched {len(articles)} articles. Building digest with OpenAI...")
+    digest_text = build_digest_with_openai(articles)
 
     print("Sending to Lark...")
-    send_to_lark(message)
+    send_to_lark(digest_text)
     print("Done!")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
